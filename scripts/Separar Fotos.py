@@ -2,60 +2,135 @@ import os
 import re
 import shutil
 from datetime import datetime
-from pathlib import Path
 
-DIR_ATUAL = Path.cwd()
+# =============================
+# Configurações e caminhos
+# =============================
+DIR_SCRIPT = os.path.dirname(os.path.abspath(__file__))
+DIR_SEPARAR = os.path.join(DIR_SCRIPT, 'Separar Fotos')
 
-regex_data = re.compile(r'_(\d{8})')
-regex_vsr_info = re.compile(r'-VSR-(.+?)_(\d{8})')  # Pega tudo entre -VSR- e _DATA
-regex_ponto = re.compile(r'P(\d+)', re.IGNORECASE)
+EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif', '.tif', '.tiff')
 
-arquivos = [f for f in os.listdir(DIR_ATUAL) if f.lower().endswith('.jpg')]
+# _YYYYMMDD_HHMMSS para extrair data
+PATT_DATETIME = re.compile(r'_(\d{8})(?:_(\d{6}))?')
 
-for arquivo in arquivos:
-    match_data = regex_data.search(arquivo)
-    if not match_data:
-        continue
+# Aceitar "VSR" com espaço/hífens ao redor e separador espaço/hífen antes do PXX
+# Exemplos aceitos:
+# ...-VSR-SETOR-A-P01_20250808_154021
+# ... VSR SETOR A P01_20250808_154021
+# ... VSR-SETOR A - P12_20250101_101010
+SEP = r'[\s-]+'  # um ou mais espaços e/ou hífens
+PATT_VSR_NOME_P = re.compile(
+    rf'VSR{SEP}([A-Za-z0-9\s-]+?){SEP}P(\d{{2,}})_(\d{{8}})(?:_(\d{{6}}))?',
+    re.IGNORECASE
+)
 
-    data_str = match_data.group(1)
-    try:
-        data = datetime.strptime(data_str, "%Y%m%d")
-    except ValueError:
-        continue
+# =============================
+# Utilitários
+# =============================
+def extrair_pasta_data(nome_arquivo: str) -> str:
+    m = PATT_DATETIME.search(nome_arquivo)
+    if not m:
+        print(f'[AVISO] Nome sem padrão de data (_YYYYMMDD): {nome_arquivo}')
+        return '00.00'
+    yyyymmdd = m.group(1)
+    return f'{yyyymmdd[4:6]}.{yyyymmdd[6:8]}'
 
-    nome_pasta_data = f"{data.month:02}.{data.day:02}"
-    pasta_data = DIR_ATUAL / nome_pasta_data
-    pasta_data.mkdir(exist_ok=True)
+def eh_vsr(nome_arquivo: str) -> bool:
+    # Basta conter "VSR" em qualquer lugar do nome
+    return 'VSR' in nome_arquivo.upper()
 
-    destino_final = pasta_data / arquivo
+def parse_vsr_nome_e_numero(nome_arquivo: str):
+    m = PATT_VSR_NOME_P.search(nome_arquivo)
+    if not m:
+        return None, None, None
+    # Remove espaços e hífens, e coloca tudo minúsculo
+    nome_limpo = re.sub(r'[\s-]+', '', m.group(1)).lower()
+    numero = int(m.group(2))
+    yyyymmdd = m.group(3)
+    return nome_limpo, numero, yyyymmdd
 
-    # Se for VSR
-    match_vsr = regex_vsr_info.search(arquivo)
-    if match_vsr:
-        vsr_bruto = match_vsr.group(1)
-        pasta_vsr = pasta_data / "VSR"
-        pasta_vsr.mkdir(exist_ok=True)
+def garantir_diretorio(caminho: str) -> None:
+    os.makedirs(caminho, exist_ok=True)
 
-        # Extrai nome do setor + número do ponto
-        partes = re.split(r'[-_ ]+', vsr_bruto)
-        setor_nome = ''
-        ponto_num = ''
+def calcular_semana_iso(yyyymmdd: str) -> int:
+    dt = datetime.strptime(yyyymmdd, '%Y%m%d').date()
+    return dt.isocalendar()[1]
 
-        for parte in partes:
-            if re.match(r'P\d+', parte, re.IGNORECASE):
-                ponto_num = str(int(parte[1:]))  # remove o 0 à esquerda
-            else:
-                setor_nome += parte.lower()
+def caminho_sem_sobrepor(dest_dir: str, nome_arquivo: str) -> str:
+    destino = os.path.join(dest_dir, nome_arquivo)
+    i = 1
+    base, ext = os.path.splitext(nome_arquivo)
+    while os.path.exists(destino):
+        destino = os.path.join(dest_dir, f'{base}_{i}{ext}')
+        i += 1
+    return destino
 
-        if setor_nome and ponto_num:
-            pasta_ponto = pasta_vsr / f"{setor_nome}{ponto_num}"
-            pasta_ponto.mkdir(exist_ok=True)
+# =============================
+# Principal
+# =============================
+def main():
+    print('== Organizador de Fotos (renomeando VSR para wXX) ==')
+    if not os.path.isdir(DIR_SEPARAR):
+        raise FileNotFoundError(f'Pasta "Separar Fotos" não encontrada: {DIR_SEPARAR}')
 
-            semana = data.isocalendar()[1]
-            destino_final = pasta_ponto / f"w{semana:02}.jpg"
+    cont_move_vsr = 0
+    cont_move_outros = 0
+    cont_vsr_fora_do_padrao = 0
+    por_data = {}
+
+    for entry in os.scandir(DIR_SEPARAR):
+        if not entry.is_file():
+            continue
+        nome = entry.name
+        if not nome.lower().endswith(EXTS):
+            continue
+
+        data_folder = extrair_pasta_data(nome)
+
+        if eh_vsr(nome):
+            nome_setor, numero, yyyymmdd = parse_vsr_nome_e_numero(nome)
+            if not nome_setor or not numero or not yyyymmdd:
+                print(f'[AVISO] VSR fora do padrão esperado: {nome}')
+                dir_vsr_base = os.path.join(DIR_SEPARAR, data_folder, 'VSR', '_indefinido')
+                garantir_diretorio(dir_vsr_base)
+                destino_final = caminho_sem_sobrepor(dir_vsr_base, nome)
+                shutil.move(entry.path, destino_final)
+                cont_vsr_fora_do_padrao += 1
+                por_data.setdefault(data_folder, {'VSR': 0, 'OUTROS': 0})
+                por_data[data_folder]['VSR'] += 1
+                continue
+
+            # Calcula semana e define nome final como wXX.jpg
+            semana = calcular_semana_iso(yyyymmdd)
+            novo_nome = f"w{semana:02}.jpg"
+
+            destino_dir = os.path.join(DIR_SEPARAR, data_folder, 'VSR', f'{nome_setor}{numero}')
+            garantir_diretorio(destino_dir)
+            destino_final = caminho_sem_sobrepor(destino_dir, novo_nome)
+            shutil.move(entry.path, destino_final)
+            cont_move_vsr += 1
+            por_data.setdefault(data_folder, {'VSR': 0, 'OUTROS': 0})
+            por_data[data_folder]['VSR'] += 1
+            print(f'[OK] VSR -> {data_folder}/VSR/{nome_setor}{numero}/{os.path.basename(destino_final)}')
         else:
-            destino_final = pasta_vsr / arquivo
+            destino_dir = os.path.join(DIR_SEPARAR, data_folder)
+            garantir_diretorio(destino_dir)
+            destino_final = caminho_sem_sobrepor(destino_dir, nome)
+            shutil.move(entry.path, destino_final)
+            cont_move_outros += 1
+            por_data.setdefault(data_folder, {'VSR': 0, 'OUTROS': 0})
+            por_data[data_folder]['OUTROS'] += 1
+            print(f'[OK] OUT -> {data_folder}/{os.path.basename(destino_final)}')
 
-    shutil.move(DIR_ATUAL / arquivo, destino_final)
+    # Resumo
+    print('----------------------------------------')
+    for data_folder, d in sorted(por_data.items()):
+        print(f'  {data_folder}: VSR={d["VSR"]} | OUTROS={d["OUTROS"]}')
+    print(f'Total movidos VSR:           {cont_move_vsr}')
+    print(f'Total movidos OUTROS:        {cont_move_outros}')
+    print(f'VSR fora do padrão esperado: {cont_vsr_fora_do_padrao}')
+    print('Concluído.')
 
-print("✅ Separação concluída com sucesso!")
+if __name__ == '__main__':
+    main()
